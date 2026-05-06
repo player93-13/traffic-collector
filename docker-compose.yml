@@ -24,6 +24,8 @@ services:
       - backend
     ports:
       - "9229:9229"
+    environment:
+      - HEALTH_BIND=0.0.0.0
 
   grafana:
     image: grafana/grafana:10

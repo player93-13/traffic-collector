@@ -28,16 +28,23 @@ DB_CONFIG = {
 }
 
 INTERVAL = int(os.getenv("INTERVAL", "60"))
+CACHE_REFRESH = int(os.getenv("CACHE_REFRESH", "300"))
+
 XRAY_API = os.getenv("XRAY_API")
 XRAY_BIN = os.getenv("XRAY_BIN", "xray")
 WG_CONTAINER = os.getenv("WG_CONTAINER")
 WG_INTERFACE = os.getenv("WG_INTERFACE")
 
-HEALTH_BIND = os.getenv("HEALTH_BIND", "127.0.0.1")
+HEALTH_BIND = os.getenv("HEALTH_BIND", "0.0.0.0")
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "9229"))
 
 running = True
 db_pool = None
+
+# ---------------- Caches ----------------
+users_cache = {}
+last_stats_cache = {}
+last_cache_reload = 0
 
 # ---------------- Signals ----------------
 def handle_signal(signum, frame):
@@ -73,11 +80,7 @@ def start_health_server():
 # ---------------- DB Pool ----------------
 def init_db_pool():
     global db_pool
-    db_pool = SimpleConnectionPool(
-        minconn=1,
-        maxconn=10,
-        **DB_CONFIG
-    )
+    db_pool = SimpleConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
     logger.info("DB pool initialized")
 
 def get_conn():
@@ -123,24 +126,22 @@ def init_db(conn):
 
     conn.commit()
 
-# ---------------- Helpers ----------------
-def get_last(cur, user_id):
-    cur.execute("SELECT rx, tx FROM last_stats WHERE user_id=%s", (user_id,))
-    row = cur.fetchone()
-    return row if row else (0, 0)
+# ---------------- Cache ----------------
+def load_caches(conn):
+    global users_cache, last_stats_cache
 
-def update_last(cur, user_id, rx, tx):
-    cur.execute("""
-    INSERT INTO last_stats (user_id, rx, tx)
-    VALUES (%s, %s, %s)
-    ON CONFLICT (user_id)
-    DO UPDATE SET rx=EXCLUDED.rx, tx=EXCLUDED.tx
-    """, (user_id, rx, tx))
-
-def build_cache(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT id, source, external_id FROM users")
-        return {(src, ext): uid for uid, src, ext in cur.fetchall()}
+        users_cache = {(src, ext): uid for uid, src, ext in cur.fetchall()}
+
+        cur.execute("SELECT user_id, rx, tx FROM last_stats")
+        last_stats_cache = {uid: (rx, tx) for uid, rx, tx in cur.fetchall()}
+
+    logger.info("Caches reloaded: users=%d last_stats=%d",
+                len(users_cache), len(last_stats_cache))
+
+def update_last_cache(user_id, rx, tx):
+    last_stats_cache[user_id] = (rx, tx)
 
 # ---------------- Commands ----------------
 def run_cmd(cmd):
@@ -157,6 +158,7 @@ def get_xray_stats():
     out = run_cmd([XRAY_BIN, "api", "statsquery", f"--server={XRAY_API}"])
     if not out:
         return {}
+
     try:
         data = json.loads(out)
     except:
@@ -166,15 +168,17 @@ def get_xray_stats():
     for item in data.get("stat", []):
         name = item.get("name", "")
         val = item.get("value", 0)
+
         if name.startswith("user>>>"):
             parts = name.split(">>>")
             if len(parts) >= 4:
                 _, user, _, direction = parts[:4]
                 users.setdefault(user, {"uplink": 0, "downlink": 0})
                 users[user][direction] = val
+
     return users
 
-def collect_xray(conn, cache):
+def collect_xray(conn):
     data = get_xray_stats()
     ts = int(time.time())
 
@@ -183,21 +187,22 @@ def collect_xray(conn, cache):
 
         for user, stats in data.items():
             key = ("xray", user)
-            if key not in cache:
+            if key not in users_cache:
                 continue
 
-            uid = cache[key]
+            uid = users_cache[key]
             rx = stats.get("downlink", 0)
             tx = stats.get("uplink", 0)
 
-            last_rx, last_tx = get_last(cur, uid)
+            last_rx, last_tx = last_stats_cache.get(uid, (0, 0))
+
             d_rx = max(0, rx - last_rx)
             d_tx = max(0, tx - last_tx)
 
             if d_rx or d_tx:
                 rows.append((ts, uid, d_rx, d_tx))
 
-            update_last(cur, uid, rx, tx)
+            update_last_cache(uid, rx, tx)
 
         if rows:
             execute_values(cur,
@@ -209,7 +214,7 @@ def collect_xray(conn, cache):
     logger.info("[XRAY] %d users", len(data))
 
 # ---------------- WG ----------------
-def collect_wg(conn, cache):
+def collect_wg(conn):
     out = run_cmd(["docker", "exec", WG_CONTAINER, "wg", "show", WG_INTERFACE])
     if not out:
         return
@@ -235,11 +240,12 @@ def collect_wg(conn, cache):
                     continue
 
                 key = ("wg", peer)
-                if key not in cache:
+                if key not in users_cache:
                     continue
 
-                uid = cache[key]
-                last_rx, last_tx = get_last(cur, uid)
+                uid = users_cache[key]
+
+                last_rx, last_tx = last_stats_cache.get(uid, (0, 0))
 
                 d_rx = max(0, rx - last_rx)
                 d_tx = max(0, tx - last_tx)
@@ -247,7 +253,7 @@ def collect_wg(conn, cache):
                 if d_rx or d_tx:
                     rows.append((ts, uid, d_rx, d_tx))
 
-                update_last(cur, uid, rx, tx)
+                update_last_cache(uid, rx, tx)
 
         if rows:
             execute_values(cur,
@@ -260,22 +266,31 @@ def collect_wg(conn, cache):
 
 # ---------------- MAIN ----------------
 def main():
+    global last_cache_reload
+
     init_db_pool()
     server = start_health_server()
+
+    conn = get_conn()
+    init_db(conn)
+    load_caches(conn)
+    put_conn(conn)
 
     while running:
         conn = None
         try:
             conn = get_conn()
-            init_db(conn)
 
-            cache = build_cache(conn)
+            now = time.time()
+            if now - last_cache_reload > CACHE_REFRESH:
+                load_caches(conn)
+                last_cache_reload = now
 
             if XRAY_API:
-                collect_xray(conn, cache)
+                collect_xray(conn)
 
             if WG_CONTAINER and WG_INTERFACE:
-                collect_wg(conn, cache)
+                collect_wg(conn)
 
         except Exception as e:
             logger.exception("Main loop error: %s", e)
