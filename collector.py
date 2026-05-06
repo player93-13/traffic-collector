@@ -80,8 +80,18 @@ def start_health_server():
 # ---------------- DB Pool ----------------
 def init_db_pool():
     global db_pool
-    db_pool = SimpleConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
-    logger.info("DB pool initialized")
+    # Валидация конфигурации перед созданием пула
+    missing = [k for k, v in DB_CONFIG.items() if not v]
+    if missing:
+        logger.error("DB config incomplete, missing: %s", missing)
+        raise RuntimeError("DB config incomplete: " + ", ".join(missing))
+
+    try:
+        db_pool = SimpleConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
+        logger.info("DB pool initialized")
+    except Exception:
+        logger.exception("Failed to initialize DB pool")
+        raise
 
 def get_conn():
     return db_pool.getconn()
@@ -148,9 +158,14 @@ def run_cmd(cmd):
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if out.returncode != 0:
+            logger.debug("Command failed %s exit=%s stderr=%s", cmd, out.returncode, out.stderr.strip())
             return None
         return out.stdout
+    except subprocess.TimeoutExpired as e:
+        logger.warning("Command timeout %s: %s", cmd, e)
+        return None
     except Exception:
+        logger.exception("Command execution failed: %s", cmd)
         return None
 
 # ---------------- XRAY ----------------
@@ -184,6 +199,7 @@ def collect_xray(conn):
 
     with conn.cursor() as cur:
         rows = []
+        last_updates = {}  # сбор последних значений для пакетной записи
 
         for user, stats in data.items():
             key = ("xray", user)
@@ -203,11 +219,20 @@ def collect_xray(conn):
                 rows.append((ts, uid, d_rx, d_tx))
 
             update_last_cache(uid, rx, tx)
+            last_updates[uid] = (rx, tx)
 
         if rows:
             execute_values(cur,
                 "INSERT INTO stats (ts, user_id, rx, tx) VALUES %s",
                 rows
+            )
+
+        # пакетная UPSERT записи last_stats
+        if last_updates:
+            ups = [(uid, rx, tx) for uid, (rx, tx) in last_updates.items()]
+            execute_values(cur,
+                "INSERT INTO last_stats (user_id, rx, tx) VALUES %s ON CONFLICT (user_id) DO UPDATE SET rx = EXCLUDED.rx, tx = EXCLUDED.tx",
+                ups
             )
 
     conn.commit()
@@ -223,20 +248,26 @@ def collect_wg(conn):
 
     with conn.cursor() as cur:
         rows = []
+        last_updates = {}
         peer = None
 
         for line in out.splitlines():
             line = line.strip()
 
             if line.startswith("peer:"):
-                peer = line.split()[1]
+                parts = line.split()
+                if len(parts) >= 2:
+                    peer = parts[1]
+                else:
+                    peer = None
 
             elif "transfer:" in line and peer:
                 try:
                     parts = line.split("transfer:")[1].split(",")
                     rx = int(parts[0].strip().split()[0])
                     tx = int(parts[1].strip().split()[0])
-                except:
+                except Exception:
+                    logger.debug("Failed to parse transfer line: %s", line)
                     continue
 
                 key = ("wg", peer)
@@ -254,11 +285,19 @@ def collect_wg(conn):
                     rows.append((ts, uid, d_rx, d_tx))
 
                 update_last_cache(uid, rx, tx)
+                last_updates[uid] = (rx, tx)
 
         if rows:
             execute_values(cur,
                 "INSERT INTO stats (ts, user_id, rx, tx) VALUES %s",
                 rows
+            )
+
+        if last_updates:
+            ups = [(uid, rx, tx) for uid, (rx, tx) in last_updates.items()]
+            execute_values(cur,
+                "INSERT INTO last_stats (user_id, rx, tx) VALUES %s ON CONFLICT (user_id) DO UPDATE SET rx = EXCLUDED.rx, tx = EXCLUDED.tx",
+                ups
             )
 
     conn.commit()
@@ -306,9 +345,18 @@ def main():
             time.sleep(1)
 
     if server:
-        server.shutdown()
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            logger.exception("Health server shutdown failed")
 
-    db_pool.closeall()
+    if db_pool:
+        try:
+            db_pool.closeall()
+        except Exception:
+            logger.exception("Failed to close DB pool")
+
     logger.info("Shutdown complete")
 
 if __name__ == "__main__":
