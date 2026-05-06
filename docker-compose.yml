@@ -28,7 +28,7 @@ services:
       - HEALTH_BIND=0.0.0.0
 
   grafana:
-    image: grafana/grafana:10
+    image: grafana/grafana:latest
     restart: unless-stopped
     depends_on:
       - db
