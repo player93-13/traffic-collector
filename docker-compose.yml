@@ -1,14 +1,47 @@
-version: "3.8"
+version: "3.9"
+
 services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
+
   collector:
     image: ghcr.io/player93-13/traffic-collector:latest
     restart: unless-stopped
     env_file: .env
-    environment:
-      - INTERVAL=60
-      - HEALTH_PORT=9229
+    depends_on:
+      - db
     networks:
       - backend
+    ports:
+      - "9229:9229"
+
+  grafana:
+    image: grafana/grafana:10
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - backend
+
+volumes:
+  pgdata:
+  grafana_data:
 
 networks:
   backend:
