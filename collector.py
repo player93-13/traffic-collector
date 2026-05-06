@@ -4,13 +4,14 @@ import os
 import time
 import json
 import subprocess
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool
-from psycopg2.extras import execute_values
 import logging
 import signal
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import psycopg2
+from psycopg2.pool import SimpleConnectionPool
+from psycopg2.extras import execute_values
 
 # ---------------- Logging ----------------
 logging.basicConfig(
@@ -32,19 +33,21 @@ CACHE_REFRESH = int(os.getenv("CACHE_REFRESH", "300"))
 
 XRAY_API = os.getenv("XRAY_API")
 XRAY_BIN = os.getenv("XRAY_BIN", "xray")
+
 WG_CONTAINER = os.getenv("WG_CONTAINER")
 WG_INTERFACE = os.getenv("WG_INTERFACE")
 
 HEALTH_BIND = os.getenv("HEALTH_BIND", "0.0.0.0")
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "9229"))
 
+# ---------------- Runtime state ----------------
 running = True
 db_pool = None
 
-# ---------------- Caches ----------------
 users_cache = {}
 last_stats_cache = {}
 last_cache_reload = 0
+
 
 # ---------------- Signals ----------------
 def handle_signal(signum, frame):
@@ -52,8 +55,10 @@ def handle_signal(signum, frame):
     logger.info("Received signal %s, shutting down...", signum)
     running = False
 
+
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
+
 
 # ---------------- Health ----------------
 class HealthHandler(BaseHTTPRequestHandler):
@@ -66,38 +71,34 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-def start_health_server():
-    try:
-        server = HTTPServer((HEALTH_BIND, HEALTH_PORT), HealthHandler)
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
-        logger.info("Health server on %s:%d", HEALTH_BIND, HEALTH_PORT)
-        return server
-    except Exception as e:
-        logger.warning("Health server failed: %s", e)
-        return None
 
-# ---------------- DB Pool ----------------
+def start_health_server():
+    server = HTTPServer((HEALTH_BIND, HEALTH_PORT), HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info("Health server on %s:%d", HEALTH_BIND, HEALTH_PORT)
+    return server
+
+
+# ---------------- DB ----------------
 def init_db_pool():
     global db_pool
-    # Валидация конфигурации перед созданием пула
+
     missing = [k for k, v in DB_CONFIG.items() if not v]
     if missing:
-        logger.error("DB config incomplete, missing: %s", missing)
-        raise RuntimeError("DB config incomplete: " + ", ".join(missing))
+        raise RuntimeError(f"DB config incomplete: {missing}")
 
-    try:
-        db_pool = SimpleConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
-        logger.info("DB pool initialized")
-    except Exception:
-        logger.exception("Failed to initialize DB pool")
-        raise
+    db_pool = SimpleConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
+    logger.info("DB pool initialized")
+
 
 def get_conn():
     return db_pool.getconn()
 
+
 def put_conn(conn):
     db_pool.putconn(conn)
+
 
 def init_db(conn):
     with conn.cursor() as cur:
@@ -122,11 +123,6 @@ def init_db(conn):
         """)
 
         cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_stats_user_ts
-        ON stats(user_id, ts)
-        """)
-
-        cur.execute("""
         CREATE TABLE IF NOT EXISTS last_stats (
             user_id INTEGER PRIMARY KEY,
             rx BIGINT,
@@ -134,7 +130,13 @@ def init_db(conn):
         )
         """)
 
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_stats_user_ts
+        ON stats(user_id, ts)
+        """)
+
     conn.commit()
+
 
 # ---------------- Cache ----------------
 def load_caches(conn):
@@ -142,31 +144,59 @@ def load_caches(conn):
 
     with conn.cursor() as cur:
         cur.execute("SELECT id, source, external_id FROM users")
-        users_cache = {(src, ext): uid for uid, src, ext in cur.fetchall()}
+        users_cache = {(s, e): uid for uid, s, e in cur.fetchall()}
 
         cur.execute("SELECT user_id, rx, tx FROM last_stats")
         last_stats_cache = {uid: (rx, tx) for uid, rx, tx in cur.fetchall()}
 
-    logger.info("Caches reloaded: users=%d last_stats=%d",
+    logger.info("Caches loaded: users=%d last_stats=%d",
                 len(users_cache), len(last_stats_cache))
 
-def update_last_cache(user_id, rx, tx):
-    last_stats_cache[user_id] = (rx, tx)
 
-# ---------------- Commands ----------------
+# ---------------- Utils ----------------
 def run_cmd(cmd):
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if out.returncode != 0:
-            logger.debug("Command failed %s exit=%s stderr=%s", cmd, out.returncode, out.stderr.strip())
             return None
         return out.stdout
-    except subprocess.TimeoutExpired as e:
-        logger.warning("Command timeout %s: %s", cmd, e)
-        return None
     except Exception:
-        logger.exception("Command execution failed: %s", cmd)
         return None
+
+
+def update_last_cache(uid, rx, tx):
+    last_stats_cache[uid] = (rx, tx)
+
+
+# ---------------- DB FLUSH (ключевая часть рефакторинга) ----------------
+def flush_last_stats(cur, updates: dict):
+    if not updates:
+        return
+
+    rows = [(uid, rx, tx) for uid, (rx, tx) in updates.items()]
+
+    execute_values(
+        cur,
+        """
+        INSERT INTO last_stats (user_id, rx, tx)
+        VALUES %s
+        ON CONFLICT (user_id)
+        DO UPDATE SET rx = EXCLUDED.rx, tx = EXCLUDED.tx
+        """,
+        rows
+    )
+
+
+def flush_stats(cur, rows):
+    if not rows:
+        return
+
+    execute_values(
+        cur,
+        "INSERT INTO stats (ts, user_id, rx, tx) VALUES %s",
+        rows
+    )
+
 
 # ---------------- XRAY ----------------
 def get_xray_stats():
@@ -180,63 +210,61 @@ def get_xray_stats():
         return {}
 
     users = {}
+
     for item in data.get("stat", []):
         name = item.get("name", "")
         val = item.get("value", 0)
 
-        if name.startswith("user>>>"):
-            parts = name.split(">>>")
-            if len(parts) >= 4:
-                _, user, _, direction = parts[:4]
-                users.setdefault(user, {"uplink": 0, "downlink": 0})
-                users[user][direction] = val
+        if not name.startswith("user>>>"):
+            continue
+
+        parts = name.split(">>>")
+        if len(parts) < 4:
+            continue
+
+        _, user, _, direction = parts[:4]
+
+        users.setdefault(user, {"uplink": 0, "downlink": 0})
+        users[user][direction] = val
 
     return users
+
 
 def collect_xray(conn):
     data = get_xray_stats()
     ts = int(time.time())
 
+    stats_rows = []
+    last_updates = {}
+
+    for user, stats in data.items():
+        key = ("xray", user)
+        if key not in users_cache:
+            continue
+
+        uid = users_cache[key]
+
+        rx = stats.get("downlink", 0)
+        tx = stats.get("uplink", 0)
+
+        last_rx, last_tx = last_stats_cache.get(uid, (0, 0))
+
+        d_rx = max(0, rx - last_rx)
+        d_tx = max(0, tx - last_tx)
+
+        if d_rx or d_tx:
+            stats_rows.append((ts, uid, d_rx, d_tx))
+
+        update_last_cache(uid, rx, tx)
+        last_updates[uid] = (rx, tx)
+
     with conn.cursor() as cur:
-        rows = []
-        last_updates = {}  # сбор последних значений для пакетной записи
-
-        for user, stats in data.items():
-            key = ("xray", user)
-            if key not in users_cache:
-                continue
-
-            uid = users_cache[key]
-            rx = stats.get("downlink", 0)
-            tx = stats.get("uplink", 0)
-
-            last_rx, last_tx = last_stats_cache.get(uid, (0, 0))
-
-            d_rx = max(0, rx - last_rx)
-            d_tx = max(0, tx - last_tx)
-
-            if d_rx or d_tx:
-                rows.append((ts, uid, d_rx, d_tx))
-
-            update_last_cache(uid, rx, tx)
-            last_updates[uid] = (rx, tx)
-
-        if rows:
-            execute_values(cur,
-                "INSERT INTO stats (ts, user_id, rx, tx) VALUES %s",
-                rows
-            )
-
-        # пакетная UPSERT записи last_stats
-        if last_updates:
-            ups = [(uid, rx, tx) for uid, (rx, tx) in last_updates.items()]
-            execute_values(cur,
-                "INSERT INTO last_stats (user_id, rx, tx) VALUES %s ON CONFLICT (user_id) DO UPDATE SET rx = EXCLUDED.rx, tx = EXCLUDED.tx",
-                ups
-            )
+        flush_stats(cur, stats_rows)
+        flush_last_stats(cur, last_updates)
 
     conn.commit()
-    logger.info("[XRAY] %d users", len(data))
+    logger.info("[XRAY] users=%d", len(data))
+
 
 # ---------------- WG ----------------
 def collect_wg(conn):
@@ -246,64 +274,55 @@ def collect_wg(conn):
 
     ts = int(time.time())
 
+    stats_rows = []
+    last_updates = {}
+
+    peer = None
+
+    for line in out.splitlines():
+        line = line.strip()
+
+        if line.startswith("peer:"):
+            parts = line.split()
+            peer = parts[1] if len(parts) > 1 else None
+            continue
+
+        if "transfer:" not in line or not peer:
+            continue
+
+        try:
+            parts = line.split("transfer:")[1].split(",")
+            rx = int(parts[0].strip().split()[0])
+            tx = int(parts[1].strip().split()[0])
+        except:
+            continue
+
+        key = ("wg", peer)
+        if key not in users_cache:
+            continue
+
+        uid = users_cache[key]
+
+        last_rx, last_tx = last_stats_cache.get(uid, (0, 0))
+
+        d_rx = max(0, rx - last_rx)
+        d_tx = max(0, tx - last_tx)
+
+        if d_rx or d_tx:
+            stats_rows.append((ts, uid, d_rx, d_tx))
+
+        update_last_cache(uid, rx, tx)
+        last_updates[uid] = (rx, tx)
+
     with conn.cursor() as cur:
-        rows = []
-        last_updates = {}
-        peer = None
-
-        for line in out.splitlines():
-            line = line.strip()
-
-            if line.startswith("peer:"):
-                parts = line.split()
-                if len(parts) >= 2:
-                    peer = parts[1]
-                else:
-                    peer = None
-
-            elif "transfer:" in line and peer:
-                try:
-                    parts = line.split("transfer:")[1].split(",")
-                    rx = int(parts[0].strip().split()[0])
-                    tx = int(parts[1].strip().split()[0])
-                except Exception:
-                    logger.debug("Failed to parse transfer line: %s", line)
-                    continue
-
-                key = ("wg", peer)
-                if key not in users_cache:
-                    continue
-
-                uid = users_cache[key]
-
-                last_rx, last_tx = last_stats_cache.get(uid, (0, 0))
-
-                d_rx = max(0, rx - last_rx)
-                d_tx = max(0, tx - last_tx)
-
-                if d_rx or d_tx:
-                    rows.append((ts, uid, d_rx, d_tx))
-
-                update_last_cache(uid, rx, tx)
-                last_updates[uid] = (rx, tx)
-
-        if rows:
-            execute_values(cur,
-                "INSERT INTO stats (ts, user_id, rx, tx) VALUES %s",
-                rows
-            )
-
-        if last_updates:
-            ups = [(uid, rx, tx) for uid, (rx, tx) in last_updates.items()]
-            execute_values(cur,
-                "INSERT INTO last_stats (user_id, rx, tx) VALUES %s ON CONFLICT (user_id) DO UPDATE SET rx = EXCLUDED.rx, tx = EXCLUDED.tx",
-                ups
-            )
+        flush_stats(cur, stats_rows)
+        flush_last_stats(cur, last_updates)
 
     conn.commit()
-    logger.info("[WG] collected")
+    logger.info("[WG] done")
 
-# ---------------- MAIN ----------------
+
+# ---------------- MAIN LOOP ----------------
 def main():
     global last_cache_reload
 
@@ -331,8 +350,8 @@ def main():
             if WG_CONTAINER and WG_INTERFACE:
                 collect_wg(conn)
 
-        except Exception as e:
-            logger.exception("Main loop error: %s", e)
+        except Exception:
+            logger.exception("Main loop error")
             time.sleep(2)
 
         finally:
@@ -345,19 +364,11 @@ def main():
             time.sleep(1)
 
     if server:
-        try:
-            server.shutdown()
-            server.server_close()
-        except Exception:
-            logger.exception("Health server shutdown failed")
+        server.shutdown()
 
-    if db_pool:
-        try:
-            db_pool.closeall()
-        except Exception:
-            logger.exception("Failed to close DB pool")
-
+    db_pool.closeall()
     logger.info("Shutdown complete")
+
 
 if __name__ == "__main__":
     main()
